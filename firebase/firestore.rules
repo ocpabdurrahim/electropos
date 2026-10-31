@@ -1,0 +1,223 @@
+rules_version = '2';
+
+// ElectroPOS: a shop's records are visible only to its members, and each role
+// may change only its own part (docs/data-model.md, "Write rights").
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function signedIn() {
+      return request.auth != null && request.auth.token.email_verified == true;
+    }
+
+    function myEmail() {
+      return request.auth.token.email.lower();
+    }
+
+    function shopPath(s) {
+      return /databases/$(database)/documents/shops/$(s);
+    }
+
+    function memberPath(s) {
+      return /databases/$(database)/documents/shops/$(s)/members/$(myEmail());
+    }
+
+    function countersPath(s) {
+      return /databases/$(database)/documents/shops/$(s)/meta/counters;
+    }
+
+    // The caller's member record in shop s, as it was before this request.
+    function hasRole(s, roles) {
+      let m = get(memberPath(s)).data;
+      return signedIn() && m.active == true && m.get('_del', false) == false && m.role in roles;
+    }
+
+    function isMember(s) {
+      return hasRole(s, ['OWNER', 'ADMIN', 'MANAGER', 'SALESPERSON']);
+    }
+
+    function stamped() {
+      return request.resource.data._ts == request.time;
+    }
+
+    // The ElectroPOS owner decides who may put a shop online. The apps carry the same list.
+    function isAppAdmin() {
+      return signedIn() && myEmail() in ['ocpabdurrahim@gmail.com'];
+    }
+
+    function mayCreateShops() {
+      return isAppAdmin() || exists(/databases/$(database)/documents/creators/$(myEmail()));
+    }
+
+    // This request creates shop s (the shop document did not exist before it).
+    function creatingShop(s) {
+      return signedIn()
+        && !exists(shopPath(s))
+        && getAfter(shopPath(s)).data.ownerUid == request.auth.uid;
+    }
+
+    function isSynced(col) {
+      return col in ['shop_profile', 'users', 'categories', 'subcategories', 'brands', 'units',
+        'suppliers', 'customers', 'products', 'product_variants', 'product_serial_imei',
+        'product_price_history', 'purchases', 'purchase_items', 'purchase_returns',
+        'purchase_return_items', 'supplier_payments', 'supplier_ledger_entries', 'sales',
+        'sale_items', 'sales_returns', 'sales_return_items', 'customer_payments',
+        'customer_ledger_entries', 'stock_transactions', 'payment_transactions', 'expenses',
+        'expense_categories', 'cash_register_transactions', 'warranty_records', 'audit_logs'];
+    }
+
+    function isSellingSide(col) {
+      return col in ['sales', 'sale_items', 'sales_returns', 'sales_return_items', 'customers',
+        'customer_payments', 'customer_ledger_entries', 'stock_transactions', 'product_serial_imei',
+        'payment_transactions', 'cash_register_transactions', 'warranty_records', 'audit_logs'];
+    }
+
+    function canRead(s, col) {
+      return col == 'users' ? hasRole(s, ['OWNER', 'ADMIN', 'MANAGER']) : isMember(s);
+    }
+
+    function canWrite(s, col) {
+      return (col == 'users' && hasRole(s, ['OWNER', 'ADMIN']))
+        || (col != 'users' && !isSellingSide(col) && hasRole(s, ['OWNER', 'ADMIN', 'MANAGER']))
+        || (isSellingSide(col) && isMember(s));
+    }
+
+    // A row document: its id field matches the document id and it carries the tombstone flag.
+    function validRow(id) {
+      return request.resource.data.id == int(id) && request.resource.data._del is bool && stamped();
+    }
+
+    // Web number counters only ever go up.
+    function countersOnlyGrow() {
+      let before = resource.data;
+      let after = request.resource.data;
+      return after.diff(before).affectedKeys().hasOnly(['nextBlock', 'nextPhone', 'inv', 'pur', 'prt', 'srt', 'spay', 'cpay', 'cus', 'sup', '_ts'])
+        && after.get('inv', 0) >= before.get('inv', 0)
+        && after.get('pur', 0) >= before.get('pur', 0)
+        && after.get('prt', 0) >= before.get('prt', 0)
+        && after.get('srt', 0) >= before.get('srt', 0)
+        && after.get('spay', 0) >= before.get('spay', 0)
+        && after.get('cpay', 0) >= before.get('cpay', 0)
+        && after.get('cus', 0) >= before.get('cus', 0)
+        && after.get('sup', 0) >= before.get('sup', 0)
+        && after.nextBlock >= before.nextBlock && after.nextBlock <= before.nextBlock + 1
+        && after.nextBlock < 2097152
+        && after.nextPhone >= before.nextPhone && after.nextPhone <= before.nextPhone + 1;
+    }
+
+    match /shops/{s} {
+      allow read: if isMember(s);
+
+      // A new shop arrives in one batch with its owner's member record, its counters
+      // and device 0, from the app owner or someone they approved.
+      allow create: if signedIn()
+        && mayCreateShops()
+        && request.resource.data.ownerUid == request.auth.uid
+        && request.resource.data.ownerEmail == myEmail()
+        && stamped()
+        && getAfter(memberPath(s)).data.role == 'OWNER';
+
+      allow update: if hasRole(s, ['OWNER', 'ADMIN'])
+        && request.resource.data.ownerUid == resource.data.ownerUid
+        && request.resource.data.ownerEmail == resource.data.ownerEmail
+        && stamped();
+
+      allow delete: if false;
+
+      match /members/{m} {
+        // Members see each other; anyone may read their own record.
+        allow read: if isMember(s) || (signedIn() && m == myEmail());
+
+        // The creator's owner record, written in the same batch as the new shop.
+        allow create: if creatingShop(s)
+          && m == myEmail()
+          && request.resource.data.email == m
+          && request.resource.data.role == 'OWNER'
+          && request.resource.data.active == true
+          && stamped();
+
+        // Owners and admins manage everyone else; nobody else becomes an owner.
+        allow create: if hasRole(s, ['OWNER', 'ADMIN'])
+          && request.resource.data.email == m
+          && request.resource.data.role in ['ADMIN', 'MANAGER', 'SALESPERSON']
+          && stamped();
+
+        allow update: if hasRole(s, ['OWNER', 'ADMIN'])
+          && resource.data.role != 'OWNER'
+          && request.resource.data.email == m
+          && request.resource.data.role in ['ADMIN', 'MANAGER', 'SALESPERSON']
+          && stamped();
+
+        // The owner may edit their own record (e.g. the name) but stays the active owner.
+        allow update: if signedIn()
+          && m == myEmail()
+          && resource.data.role == 'OWNER'
+          && request.resource.data.role == 'OWNER'
+          && request.resource.data.active == true
+          && request.resource.data.get('_del', false) == false
+          && request.resource.data.email == m
+          && stamped();
+
+        allow delete: if false;
+      }
+
+      match /meta/{doc} {
+        allow read: if isMember(s);
+
+        // Created with the shop: block 0 and till A are already taken by the creating phone.
+        allow create: if doc == 'counters'
+          && creatingShop(s)
+          && request.resource.data.nextBlock == 1
+          && request.resource.data.nextPhone == 1
+          && stamped();
+
+        allow update: if doc == 'counters' && isMember(s) && countersOnlyGrow() && stamped();
+        allow delete: if false;
+      }
+
+      match /devices/{b} {
+        allow read: if isMember(s);
+
+        // Block 0 belongs to the phone that creates the shop.
+        allow create: if b == '0'
+          && creatingShop(s)
+          && request.resource.data.block == 0
+          && request.resource.data.kind == 'PHONE'
+          && stamped();
+
+        // Any other block is claimed together with the counter that hands it out.
+        allow create: if isMember(s)
+          && int(b) == get(countersPath(s)).data.nextBlock
+          && getAfter(countersPath(s)).data.nextBlock == int(b) + 1
+          && request.resource.data.block == int(b)
+          && request.resource.data.email == myEmail()
+          && (request.resource.data.kind == 'WEB'
+              || (request.resource.data.kind == 'PHONE' && hasRole(s, ['OWNER', 'ADMIN', 'MANAGER'])))
+          && stamped();
+
+        allow update, delete: if false;
+      }
+
+      match /{col}/{id} {
+        allow read: if isSynced(col) && canRead(s, col);
+        allow create, update: if isSynced(col) && canWrite(s, col) && validRow(id);
+        allow delete: if false;
+      }
+    }
+
+    // Lets a signed-in person find the shops they belong to
+    // (collection-group query on members where email == their email).
+    match /{path=**}/members/{m} {
+      allow read: if signedIn() && resource.data.email == myEmail();
+    }
+
+    // People the app owner has allowed to put shops online; the id is their email.
+    match /creators/{e} {
+      allow read: if isAppAdmin() || (signedIn() && e == myEmail());
+      allow create, update: if isAppAdmin()
+        && request.resource.data.email == e
+        && request.resource.data.keys().hasOnly(['email', 'name', 'approvedBy', 'approvedAt', '_ts'])
+        && stamped();
+      allow delete: if isAppAdmin();
+    }
+  }
+}

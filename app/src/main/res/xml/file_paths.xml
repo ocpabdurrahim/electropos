@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<paths>
+    <!-- Invoice PDFs written by InvoiceExporter -->
+    <cache-path
+        name="invoices"
+        path="invoices/" />
+</paths>

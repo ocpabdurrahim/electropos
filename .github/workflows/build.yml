@@ -1,0 +1,217 @@
+name: Build
+
+# Every push: unit tests, debug + release APKs, then the app is run on an
+# Android 14 emulator (instrumented tests against the Firebase emulators,
+# self-update, release-build smoke test).
+# When everything passes on main and appVersionName in app/build.gradle.kts is
+# newer than the latest release, the release is published by itself (tag
+# vX.Y.Z plus the signed APK), and installed phones update to it.
+on:
+  push:
+    branches: [main]
+    # Web-only changes are built by web.yml.
+    paths-ignore: ['web/**', 'docs/**', 'firebase/**', 'firebase.json', '.github/workflows/web.yml', 'README.md']
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build and unit-test
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    env:
+      EPOS_KEYSTORE_BASE64: ${{ secrets.EPOS_KEYSTORE_BASE64 }}
+      EPOS_KEYSTORE_PASSWORD: ${{ secrets.EPOS_KEYSTORE_PASSWORD }}
+      EPOS_KEY_ALIAS: ${{ secrets.EPOS_KEY_ALIAS }}
+      EPOS_KEY_PASSWORD: ${{ secrets.EPOS_KEY_PASSWORD }}
+      FIREBASE_GOOGLE_SERVICES: ${{ secrets.FIREBASE_GOOGLE_SERVICES }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - uses: gradle/actions/setup-gradle@v4
+
+      # Without the secrets (e.g. a fork) the release APK is debug-signed instead.
+      - name: Restore the release signing key
+        if: env.EPOS_KEYSTORE_BASE64 != ''
+        run: |
+          echo "$EPOS_KEYSTORE_BASE64" | base64 --decode > "$RUNNER_TEMP/electropos-release.jks"
+          echo "EPOS_KEYSTORE_FILE=$RUNNER_TEMP/electropos-release.jks" >> "$GITHUB_ENV"
+
+      # Test builds are signed with a fixed debug key that is not in the repository.
+      - name: Debug signing key
+        run: |
+          keytool -genkeypair -keystore debug.keystore -storepass android -alias androiddebugkey \
+            -keypass android -keyalg RSA -keysize 2048 -validity 10000 -dname "CN=Android Debug,O=Android,C=US"
+
+      - name: Firebase config
+        run: bash .github/scripts/google-services.sh
+
+      # Debug builds talk to the Firebase emulators the test job runs (10.0.2.2 = the host).
+      - name: Unit tests and APKs
+        run: |
+          chmod +x gradlew
+          TEST_PROPS="-PfirebaseEmulatorHost=10.0.2.2 -PupdateApiUrl=http://10.0.2.2:8000/latest.json"
+          ./gradlew --stacktrace $TEST_PROPS testDebugUnitTest assembleDebug assembleDebugAndroidTest assembleRelease
+          # A "newer" copy of the debug app for the self-update test.
+          cp app/build/outputs/apk/debug/app-debug.apk "$RUNNER_TEMP/app-debug.apk"
+          ./gradlew $TEST_PROPS -PversionCodeOverride=990000 -PversionNameOverride=99.0.0 assembleDebug
+          mkdir -p app/build/outputs/apk/update
+          cp app/build/outputs/apk/debug/app-debug.apk app/build/outputs/apk/update/ElectroPOS-99.0.0.apk
+          cp "$RUNNER_TEMP/app-debug.apk" app/build/outputs/apk/debug/app-debug.apk
+
+      - name: Name the release APK
+        run: |
+          version=$(sed -n 's/^val appVersionName = "\(.*\)"/\1/p' app/build.gradle.kts)
+          mkdir -p dist
+          cp app/build/outputs/apk/release/app-release.apk "dist/ElectroPOS-$version.apk"
+          ls -l dist
+          apksigner="$(ls -d "$ANDROID_HOME"/build-tools/*/ | sort -V | tail -1)apksigner"
+          "$apksigner" verify --print-certs dist/*.apk | head -n 3
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ElectroPOS-apk
+          path: dist/*.apk
+          if-no-files-found: error
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: test-apks
+          retention-days: 7
+          path: |
+            app/build/outputs/apk/debug/app-debug.apk
+            app/build/outputs/apk/androidTest/debug/app-debug-androidTest.apk
+            app/build/outputs/apk/release/app-release.apk
+            app/build/outputs/apk/update/ElectroPOS-99.0.0.apk
+
+      - name: Upload test reports
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-reports
+          path: app/build/reports/
+
+
+  emulator:
+    name: Emulator tests
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      FIREBASE_GOOGLE_SERVICES: ${{ secrets.FIREBASE_GOOGLE_SERVICES }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: test-apks
+          path: apks
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      # Sets FIREBASE_PROJECT, which only later steps can see.
+      - name: Firebase config
+        run: bash .github/scripts/google-services.sh
+
+      - name: Start the Firebase emulators
+        run: |
+          nohup npx --yes firebase-tools@13.29.1 emulators:start --only auth,firestore --project "$FIREBASE_PROJECT" > firebase-emulators.log 2>&1 &
+          for i in $(seq 1 90); do
+            if curl -s -o /dev/null http://127.0.0.1:8085 && curl -s -o /dev/null http://127.0.0.1:9099; then echo "Emulators up"; exit 0; fi
+            sleep 2
+          done
+          cat firebase-emulators.log
+          exit 1
+
+      - name: Enable KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+
+      - name: Run on an Android 14 emulator
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: 34
+          target: google_apis
+          arch: x86_64
+          profile: pixel_6
+          disable-animations: true
+          emulator-options: -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -camera-back none
+          script: bash .github/scripts/emulator-checks.sh
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: emulator-results
+          path: |
+            emulator-out/
+            firebase-emulators.log
+
+  release:
+    name: Publish the release
+    # Only from main, and only once the build and the emulator tests have passed.
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: [build, emulator]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Is this a new version?
+        id: version
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          version=$(sed -n 's/^val appVersionName = "\(.*\)"/\1/p' app/build.gradle.kts)
+          latest=$(gh release view --json tagName --jq .tagName 2>/dev/null | sed 's/^v//' || true)
+          echo "This build: $version. Latest release: ${latest:-none}."
+          newest=$(printf '%s\n%s\n' "${latest:-0}" "$version" | sort -V | tail -1)
+          if gh release view "v$version" > /dev/null 2>&1; then
+            echo "v$version is already published; nothing to do."
+            echo "publish=false" >> "$GITHUB_OUTPUT"
+          elif [ "$newest" != "$version" ]; then
+            echo "::warning::appVersionName $version is older than the latest release $latest; nothing published."
+            echo "publish=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "publish=true" >> "$GITHUB_OUTPUT"
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/download-artifact@v4
+        if: steps.version.outputs.publish == 'true'
+        with:
+          name: ElectroPOS-apk
+          path: dist
+
+      - name: Create the release
+        if: steps.version.outputs.publish == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          gh release create "v$VERSION" dist/*.apk \
+            --target "$GITHUB_SHA" \
+            --title "ElectroPOS v$VERSION" \
+            --notes-file docs/release-notes.md
+          echo "Published v$VERSION; installed phones pick it up on their next check."

@@ -1,0 +1,52 @@
+name: Web
+
+# Type-checks, tests and builds the web app, and checks the security rules
+# against the Firestore emulator, whenever either changes.
+on:
+  push:
+    branches: [main]
+    paths: ['web/**', 'firebase/**', 'firebase.json', '.github/workflows/web.yml']
+  pull_request:
+    paths: ['web/**', 'firebase/**', 'firebase.json', '.github/workflows/web.yml']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Test and build
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: web
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      # The Firestore emulator runs on Java.
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - run: npm ci
+      - run: npm test
+
+      - name: Security rules (Firestore emulator)
+        working-directory: .
+        run: npx --yes firebase-tools@13.29.1 emulators:exec --only firestore --project demo-electropos "npm --prefix web run test:rules"
+
+      - run: npm run build
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: web-dist
+          path: web/dist/
+          retention-days: 7

@@ -1,0 +1,28 @@
+{
+  "project_info": {
+    "project_number": "000000000000",
+    "project_id": "demo-electropos",
+    "storage_bucket": "demo-electropos.appspot.com"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:000000000000:android:0000000000000001",
+        "android_client_info": { "package_name": "io.github.ocpabdurrahim.electropos" }
+      },
+      "oauth_client": [{ "client_id": "000000000000-demo.apps.googleusercontent.com", "client_type": 3 }],
+      "api_key": [{ "current_key": "demo-api-key" }],
+      "services": { "appinvite_service": { "other_platform_oauth_client": [] } }
+    },
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:000000000000:android:0000000000000002",
+        "android_client_info": { "package_name": "io.github.ocpabdurrahim.electropos.debug" }
+      },
+      "oauth_client": [{ "client_id": "000000000000-demo.apps.googleusercontent.com", "client_type": 3 }],
+      "api_key": [{ "current_key": "demo-api-key" }],
+      "services": { "appinvite_service": { "other_platform_oauth_client": [] } }
+    }
+  ],
+  "configuration_version": "1"
+}

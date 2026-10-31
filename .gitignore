@@ -1,0 +1,26 @@
+*.iml
+.gradle
+.kotlin
+/local.properties
+/.idea/caches
+/.idea/libraries
+/.idea/modules.xml
+/.idea/workspace.xml
+/.idea/navEditor.xml
+/.idea/assetWizardSettings.xml
+.DS_Store
+/build
+/captures
+.externalNativeBuild
+.cxx
+local.properties
+.env
+debug.keystore
+*-debug.log
+
+# Firebase config comes from CI secrets / the Firebase console, not the repo
+app/google-services.json
+.firebase/
+web/node_modules/
+web/dist/
+web/.env.local
