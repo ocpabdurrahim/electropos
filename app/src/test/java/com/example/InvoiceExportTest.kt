@@ -8,6 +8,7 @@ import android.graphics.Bitmap
 import android.graphics.Canvas
 import android.graphics.pdf.PdfDocument
 import android.net.Uri
+import androidx.core.content.FileProvider
 import androidx.room.Room
 import androidx.test.core.app.ApplicationProvider
 import com.example.core.invoice.InvoiceExporter
@@ -68,6 +69,11 @@ class InvoiceExportTest {
                 Uri.Builder().scheme(ContentResolver.SCHEME_CONTENT).authority(exporter.authority)
                     .appendPath(InvoiceExporter.INVOICE_DIR).appendPath(file.name).build()
             }
+        } else {
+            // FileProvider caches its roots per authority for the whole process, but Robolectric gives every
+            // test a new cache dir: without this, only the first test's files would be inside a known root.
+            FileProvider::class.java.getDeclaredField("sCache").apply { isAccessible = true }
+                .let { (it.get(null) as MutableMap<*, *>).clear() }
         }
     }
 
